@@ -92,10 +92,10 @@ def _fp8_mla_prefill_supported() -> bool:
     """Auto-detect FP8 MLA prefill via mla_prefill_ps_asm_fwd + mla_reduce_v1.
 
     Requires gfx950 plus an AITER build that exports both kernels.  When
-    either is missing, or ``VLLM_ROCM_AITER_MLA_DISABLE_FP8_PREFILL`` is set,
+    either is missing, or ``VLLM_ROCM_AITER_MLA_USE_FP8_PREFILL`` is disabled,
     we silently fall back to ``flash_attn_varlen_func``.
     """
-    if envs.VLLM_ROCM_AITER_MLA_DISABLE_FP8_PREFILL:
+    if not envs.VLLM_ROCM_AITER_MLA_USE_FP8_PREFILL:
         return False
     try:
         from vllm.platforms.rocm import on_gfx950

@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["auto", "asm", "segmented"] = "auto"
-    VLLM_ROCM_AITER_MLA_DISABLE_FP8_PREFILL: bool = False
+    VLLM_ROCM_AITER_MLA_USE_FP8_PREFILL: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
@@ -1344,11 +1344,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["auto", "gluon", "asm"],
         case_sensitive=False,
     ),
-    # Disable the gfx950 FP8 MLA prefill so prefill runs through the bf16
-    # flash-attention path instead. By default is disabled (FP8 prefill is
-    # used where supported).
-    "VLLM_ROCM_AITER_MLA_DISABLE_FP8_PREFILL": lambda: (
-        os.getenv("VLLM_ROCM_AITER_MLA_DISABLE_FP8_PREFILL", "False").lower()
+    # Whether to use the gfx950 FP8 MLA prefill where supported. When disabled,
+    # prefill runs through the bf16 flash-attention path instead.
+    # By default is enabled.
+    "VLLM_ROCM_AITER_MLA_USE_FP8_PREFILL": lambda: (
+        os.getenv("VLLM_ROCM_AITER_MLA_USE_FP8_PREFILL", "True").lower()
         in ("true", "1")
     ),
     # Whether to use aiter mha ops.

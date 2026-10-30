@@ -219,6 +219,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     VllmConfig,
     get_current_vllm_config,
@@ -318,6 +319,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+@dataclass
+class _DeferredRoPEKVCache:
+    """fused_rope_unified_mla_kv_cache_update inputs that forward_impl's fused
+    decode query kernel needs to do the RoPE and KV-cache write instead."""
+
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    is_neox: bool
+    slot_mapping: torch.Tensor
+    k_scale: torch.Tensor
 
 
 def _detect_output_quant_key(
@@ -735,6 +748,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and not self.is_amx_bmm_enabled
             and self.q_pad_num_heads is None
         )
+        # Set by fused_rope_unified_mla_kv_cache_update when forward_impl's fused
+        # decode query kernel also does its RoPE and KV-cache write this step.
+        self._deferred_rope_kv_cache: _DeferredRoPEKVCache | None = None
 
         # Attributes for forward_impl method
         self._vllm_config = get_current_vllm_config()
@@ -964,6 +980,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output.fill_(0)
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
+        deferred = self._deferred_rope_kv_cache
+        self._deferred_rope_kv_cache = None
 
         num_actual_toks = attn_metadata.num_actual_tokens
         if self.use_pcp and self.impl.dcp_world_size > 1 and quant_key is not None:
@@ -1001,6 +1019,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if not use_mha:
                 num_mqa_tokens = q.size(0)
                 num_mha_tokens = 0
+        assert deferred is None or num_mha_tokens == 0, (
+            "a deferred RoPE + KV-cache write needs a pure decode batch"
+        )
 
         mha_use_quant_output = (
             quant_key is not None
@@ -1060,9 +1081,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q_pe = mqa_pe_padded
 
             fused_q_heads = self._fused_decode_query_num_heads(
-                attn_metadata, fp8_attention
+                attn_metadata, fp8_attention, rope_and_cache=deferred is not None
             )
-            if fused_q_heads is not None:
+            if deferred is not None:
+                assert fused_q_heads is not None
+                mqa_q = rocm_aiter_ops.fused_bf16_bmm_rope_cat_quant_pad_cache_mla(
+                    mqa_q_nope,
+                    self.W_UK_T,
+                    mqa_q_pe,
+                    self._q_scale,
+                    k_c_normed[:num_mqa_tokens],
+                    k_pe[:num_mqa_tokens].squeeze(1),
+                    kv_cache,
+                    deferred.slot_mapping[:num_mqa_tokens],
+                    deferred.k_scale,
+                    deferred.positions[:num_mqa_tokens],
+                    deferred.cos_sin_cache,
+                    deferred.is_neox,
+                    fused_q_heads,
+                )
+            elif fused_q_heads is not None:
                 mqa_q = rocm_aiter_ops.fused_bf16_bmm_cat_quant_pad_mla(
                     mqa_q_nope, self.W_UK_T, mqa_q_pe, self._q_scale, fused_q_heads
                 )
@@ -1419,22 +1457,68 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return spec
 
     def _fused_decode_query_num_heads(
-        self, attn_metadata: "MLACommonMetadata", fp8_attention: bool
+        self,
+        attn_metadata: "MLACommonMetadata",
+        fp8_attention: bool,
+        rope_and_cache: bool = False,
     ) -> int | None:
         """Head count of the padded fp8 query AITER's fused W_UK absorb + concat +
         quant + head padding builds for this decode step, or None to run the
-        unfused ops."""
+        unfused ops. rope_and_cache asks for the variant that also does the RoPE
+        and the KV-cache write."""
+        is_tuned = (
+            rocm_aiter_ops.is_fused_bf16_bmm_rope_cat_quant_pad_cache_mla_tuned
+            if rope_and_cache
+            else rocm_aiter_ops.is_fused_bf16_bmm_cat_quant_pad_mla_tuned
+        )
         if not (
             self.is_aiter_fused_decode_query_enabled
             and fp8_attention
             and self.impl.supports_quant_query_input
             and self.impl.dcp_world_size == 1
-            and rocm_aiter_ops.is_fused_bf16_bmm_cat_quant_pad_mla_tuned(
-                self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim
-            )
+            and is_tuned(self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim)
         ):
             return None
         return self.impl.decode_query_padded_num_heads(attn_metadata)  # type: ignore[attr-defined]
+
+    def defer_rope_kv_cache_update(
+        self,
+        attn_metadata: "MLACommonMetadata | None",
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+    ) -> bool:
+        """Whether forward_impl's fused decode query kernel does this step's RoPE
+        and KV-cache write, so fused_rope_unified_mla_kv_cache_update skips them.
+        Only when both ops run their host code in this forward: eager, or a FULL
+        cudagraph capture. A piecewise or breakable capture bakes the cache
+        update into the graph but runs attention eagerly at each replay."""
+        forward_context = get_forward_context()
+        if not (
+            attn_metadata is not None
+            and forward_context.cudagraph_runtime_mode
+            in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
+            and forward_context.ubatch_slices is None
+            and self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and not self.impl.is_sparse
+            and not self.use_pcp
+            and self.hisparse_cache is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
+            and cos_sin_cache.dtype == torch.bfloat16
+            and cos_sin_cache.shape[-1] == self.qk_rope_head_dim
+            and self._fused_decode_query_num_heads(
+                attn_metadata, fp8_attention=True, rope_and_cache=True
+            )
+            is not None
+        ):
+            return False
+        self._deferred_rope_kv_cache = _DeferredRoPEKVCache(
+            positions, cos_sin_cache, is_neox, slot_mapping, k_scale
+        )
+        return True
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)

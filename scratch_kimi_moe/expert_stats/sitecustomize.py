@@ -7,7 +7,12 @@ Put this directory on PYTHONPATH and set MOE_EXPERT_STATS_DIR. Every Python proc
 imports aiter.fused_moe, fused_moe is wrapped so each eager call appends one line to
 MOE_EXPERT_STATS_DIR/expert_stats_<pid>.txt:
 
-    call_index tokens topk n_experts distinct_total distinct_routed shared_in_every_row
+    call_index tokens topk n_experts distinct_total distinct_routed
+    shared_in_every_row tag
+
+tag is the content of MOE_EXPERT_STATS_DIR/tag (re-read every 20 calls; "-" when the
+file is missing), so one server can measure several workloads: write a new tag
+between benchmark runs.
 
 The wrapper only runs on eager calls (it skips CUDA-graph capture), so serve with
 -cc.cudagraph_mode=NONE to see every step. It syncs on each call; use it for
@@ -30,10 +35,20 @@ def _wrap(module):
     # Stays open for the whole process; closed at exit.
     out = open(path, "a", buffering=1 << 16)  # noqa: SIM115
     atexit.register(out.close)
-    state = {"calls": 0}
+    tag_path = os.path.join(_OUT_DIR, "tag")
+    state = {"calls": 0, "tag": "-"}
+
+    def read_tag():
+        try:
+            with open(tag_path) as f:
+                return f.read().strip().replace(" ", "_") or "-"
+        except OSError:
+            return "-"
 
     def fused_moe(hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs):
         if not torch.cuda.is_current_stream_capturing():
+            if state["calls"] % 20 == 0:
+                state["tag"] = read_tag()
             n_experts = w1.shape[0]
             shared_id = n_experts - 1
             ids = topk_ids
@@ -42,10 +57,11 @@ def _wrap(module):
             shared_every_row = bool((ids == shared_id).any(dim=1).all())
             out.write(
                 f"{state['calls']} {ids.shape[0]} {ids.shape[1]} {n_experts} "
-                f"{distinct_total} {distinct_routed} {int(shared_every_row)}\n"
+                f"{distinct_total} {distinct_routed} {int(shared_every_row)} "
+                f"{state['tag']}\n"
             )
             state["calls"] += 1
-            if state["calls"] % 600 == 0:
+            if state["calls"] % 60 == 0:
                 out.flush()
         return orig(hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs)
 
